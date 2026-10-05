@@ -1,0 +1,272 @@
+// MLCC v2 — real Argent source, second compile attempt.
+//
+// First attempt's error (reported back, not guessed): "entry
+// Policy::openReusable uses actor enum LeafTemplate for state LeafState,
+// but the entry actor owns PolicyState; selector values currently require
+// the same state." Dynamic actor-enum dispatch (`become x <- chosen(state)`)
+// only works inside an entry hosted by an actor that itself owns the
+// enum's shared state type — dynamic_actor_choice.rs didn't surface this
+// because Router/Alpha/Beta all happened to already share RouteState.
+//
+// Fix: Purse (not Policy) hosts the dispatch, since Purse is what actually
+// becomes a LeafTemplate. Purse owns LeafState from genesis on (with a
+// placeholder owner/unlock_time before any leaf is opened) and is now the
+// "leader" (consumes Policy, owns the `become` for both outputs); Policy
+// is the "follower" (`delegate`, no emits/become, just require()s) — the
+// same leader/follower roles as before, just swapped between the two
+// actors. Mechanism itself still confirmed by examples/open_icc/core.ag
+// and examples/stones/settle.ag + player.ag.
+//
+// Separately: the Merkle scheme below was also brought in line with
+// rust/src/lib.rs, in both directions. `branch()`'s hashing now matches
+// rust's — no sorting (byte[32] has no ordered-comparison operator in
+// Silverscript, confirmed in the compiler's own type checker — only the
+// Rust side could change there), and now also the domain tags, which
+// this file previously got wrong the other way: single-byte placeholders
+// (0x01/0x02) instead of the ASCII strings SPEC.md actually specifies
+// (now fixed here — Rust already had this right). See SPEC.md's "Known
+// gaps" for both.
+
+const byte ONE_TIME_FLAG = 0x01;
+
+// --- Merkle helpers --------------------------------------------------------
+
+// Domain tags are the exact ASCII strings SPEC.md specifies
+// (MLCC2Leaf/MLCC2Branch), matching rust/src/lib.rs's LEAF_TAG/BRANCH_TAG
+// byte-for-byte — confirmed real syntax: examples/stones/league.ag casts
+// a string literal straight to byte[] the same way
+// (`byte[]("StonesPlayer")`). An earlier version of this file used
+// single-byte placeholder tags (0x01/0x02) carried over from the unrelated
+// v1 MLCC project; those didn't match the Rust crate's tags at all, which
+// would have made every on-chain hash disagree with the off-chain
+// commitment scheme regardless of the branch()-sorting fix elsewhere in
+// this file. Caught and fixed together.
+fn hash_leaf(byte[] leaf) -> byte[32] {
+    return blake3(byte[]("MLCC2Leaf") + leaf);
+}
+
+fn hash_branch(byte[32] current, byte[32] sibling, bool sibling_on_right) -> byte[32] {
+    byte[] tag = byte[]("MLCC2Branch");
+    if (sibling_on_right) {
+        return blake3(byte[](tag + current + sibling));
+    } else {
+        return blake3(byte[](tag + sibling + current));
+    }
+}
+
+state ProofStep {
+    byte[32] sibling;
+    bool sibling_on_right;
+}
+
+fn merkle_verify(byte[32] leaf_c, ProofStep[] path, byte[32] root) -> bool {
+    byte[32] current = leaf_c;
+    for (i, 0, path.length, 4) {
+        current = hash_branch(current, path[i].sibling, path[i].sibling_on_right);
+    }
+    return current == root;
+}
+
+fn encode_leaf_payload(byte[32] template_hash, byte[32] param_commitment, byte leaf_flags) -> byte[] {
+    return byte[](template_hash + param_commitment + byte[1](leaf_flags));
+}
+
+// --- Leaf templates ----------------------------------------------------
+
+state LeafState {
+    byte[32] owner;
+    temporal unlock_time; // unused by NormalSpend; also Purse's state
+                          // pre-open (placeholder values — see Purse)
+}
+
+actor enum LeafTemplate {
+    RecoveryVault;
+    NormalSpend;
+}
+
+actor RecoveryVault owns LeafState {
+    entry claim(sig owner_sig, pubkey owner_pk) emits {
+        next: RecoveryVault,
+    } {
+        require(blake2b(byte[](owner_pk)) == owner);
+        require(checkSig(owner_sig, owner_pk));
+        require(tx.time >= unlock_time);
+
+        LeafState next_state = {
+            owner: owner,
+            unlock_time: unlock_time,
+        };
+
+        require(next.value == self.value);
+
+        become next <- RecoveryVault(next_state);
+    }
+}
+
+actor NormalSpend owns LeafState {
+    entry spend(sig owner_sig, pubkey owner_pk) emits {
+        next: NormalSpend,
+    } {
+        require(blake2b(byte[](owner_pk)) == owner);
+        require(checkSig(owner_sig, owner_pk));
+
+        LeafState next_state = {
+            owner: owner,
+            unlock_time: unlock_time,
+        };
+
+        require(next.value == self.value);
+
+        become next <- NormalSpend(next_state);
+    }
+}
+
+// --- Policy / Purse ------------------------------------------------------
+
+state PolicyState {
+    byte[32] root;
+    byte flags;
+    byte n;
+}
+
+actor Policy owns PolicyState {
+    entry setup(byte[32] initial_root, byte initial_flags, byte initial_n) emits {
+        next: PolicyState,
+    } {
+        require(initial_root != byte[32](0x0000000000000000000000000000000000000000000000000000000000000000));
+
+        PolicyState next_state = {
+            root: initial_root,
+            flags: initial_flags,
+            n: initial_n,
+        };
+
+        require(next.value == self.value);
+
+        become next <- PolicyState(next_state);
+    }
+
+    // Follower side of Purse's openReusable/openTerminal (below): no
+    // emits, no become — Purse's own `become` dictates this input's
+    // actual output. The flag check here is deliberately redundant with
+    // Purse's copy of it — each side independently asserts what it needs
+    // for the transaction to be valid at all, per the leader/follower
+    // pattern (see player.ag's delegate settle()).
+    delegate openReusable() consumes {
+        purse: Purse,
+    } {
+        require(flags & ONE_TIME_FLAG == 0);
+    }
+
+    delegate openTerminal() consumes {
+        purse: Purse,
+    } {
+        require(flags & ONE_TIME_FLAG != 0);
+    }
+}
+
+// Purse owns LeafState (not a separate PurseState) specifically so it can
+// host the dynamic LeafTemplate dispatch — see this file's header. Before
+// any leaf is opened, its "owner"/"unlock_time" are placeholders with no
+// meaning; genesis_setup takes them as explicit parameters rather than
+// hardcoding a zero constant, to avoid relying on an unconfirmed
+// temporal(0)-style cast.
+actor Purse owns LeafState {
+    entry genesis_setup(byte[32] owner_placeholder, temporal unlock_placeholder) emits {
+        next: Purse,
+    } {
+        LeafState next_state = {
+            owner: owner_placeholder,
+            unlock_time: unlock_placeholder,
+        };
+
+        require(next.value == self.value);
+
+        become next <- Purse(next_state);
+    }
+
+    entry openReusable(
+        byte[32] template_hash,
+        byte[32] param_commitment,
+        byte leaf_flags,
+        ProofStep[] path,
+        LeafTemplate chosen,
+        byte[32] owner,
+        temporal unlock_time
+    ) consumes {
+        policy: Policy,
+    } emits {
+        next: LeafTemplate,
+        policy_next: Policy,
+    } {
+        require(policy.flags & ONE_TIME_FLAG == 0);
+
+        byte[] encoded = encode_leaf_payload(template_hash, param_commitment, leaf_flags);
+        byte[32] leaf_c = hash_leaf(encoded);
+        require(merkle_verify(leaf_c, path, policy.root));
+
+        require(blake3(byte[](byte[1](chosen))) == template_hash);
+        require(blake3(owner) == param_commitment);
+
+        LeafState leaf_state = {
+            owner: owner,
+            unlock_time: unlock_time,
+        };
+
+        PolicyState next_policy_state = {
+            root: policy.root,
+            flags: policy.flags,
+            n: policy.n,
+        };
+
+        require(next.value == self.value);
+        require(policy_next.value == policy.value);
+
+        become {
+            next <- chosen(leaf_state),
+            policy_next <- Policy(next_policy_state),
+        };
+    }
+
+    entry openTerminal(
+        byte[32] template_hash,
+        byte[32] param_commitment,
+        byte leaf_flags,
+        ProofStep[] path,
+        LeafTemplate chosen,
+        byte[32] owner,
+        temporal unlock_time
+    ) consumes {
+        policy: Policy,
+    } emits {
+        next: LeafTemplate,
+    } {
+        require(policy.flags & ONE_TIME_FLAG != 0);
+
+        byte[] encoded = encode_leaf_payload(template_hash, param_commitment, leaf_flags);
+        byte[32] leaf_c = hash_leaf(encoded);
+        require(merkle_verify(leaf_c, path, policy.root));
+
+        require(blake3(byte[](byte[1](chosen))) == template_hash);
+        require(blake3(owner) == param_commitment);
+
+        LeafState leaf_state = {
+            owner: owner,
+            unlock_time: unlock_time,
+        };
+
+        // Policy's own value joins Purse's, since no successor Policy
+        // output exists to hold it (Policy's delegate openTerminal has no
+        // output role at all).
+        require(next.value == self.value + policy.value);
+
+        become next <- chosen(leaf_state);
+    }
+}
+
+app MLCC2 {
+    actor Policy;
+    actor Purse;
+    actor RecoveryVault;
+    actor NormalSpend;
+}
